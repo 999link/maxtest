@@ -160,4 +160,62 @@ async def got_2fa(m: Message, state: FSMContext):
 
 async def finish_login(m: Message, state: FSMContext,
                        session: MaxSession, res: dict, wait: Message):
-    await storage.save
+    """Сохраняет сессию в storage и завершает FSM."""
+    try:
+        token = res.get("token") if isinstance(res, dict) else None
+        user_agent = res.get("user_agent") if isinstance(res, dict) else None
+        profile = res.get("profile") if isinstance(res, dict) else session.profile
+        raw = res.get("raw") if isinstance(res, dict) else None
+
+        if token is None:
+            # Попробуем взять из объекта session
+            token = getattr(session, "token", None)
+
+        await storage.save_account(
+            m.from_user.id,
+            phone=session.phone,
+            token=token,
+            profile=profile,
+            user_agent=user_agent,
+            extra=raw,
+        )
+
+        await state.clear()
+        await wait.edit_text("✅ Авторизация завершена.\n\n" + code_block(res))
+    except Exception as e:
+        log.exception("finish_login error: %s", e)
+        await wait.edit_text(f"Ошибка при сохранении сессии: {e}")
+
+
+# Точка входа для запуска бота
+async def _shutdown(bot: Bot):
+    # корректно закрыть все live-сессии
+    for s in list(LIVE.values()):
+        try:
+            await s.close()
+        except Exception:
+            pass
+    try:
+        await bot.session.close()
+    except Exception:
+        pass
+
+
+async def main():
+    if not BOT_TOKEN:
+        log.error("BOT_TOKEN is not set. Set BOT_TOKEN env var and restart.")
+        return
+    bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+    try:
+        await dp.start_polling(bot)
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        await _shutdown(bot)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
