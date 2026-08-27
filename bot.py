@@ -64,35 +64,34 @@ def profile_kb() -> InlineKeyboardMarkup:
 def extract_tokens_from_text(text: str) -> List[str]:
     """Extracts tokens from a text blob.
 
-    Handles JSON-like payloads with "token": "..." and generic token strings.
-    Returns list of unique tokens found.
+    Handles JSON-like payloads where the quoted token value may span lines
+    (e.g. long tokens that are visually wrapped), supports both double and
+    single quotes; also captures generic token-like contiguous strings.
+    Returns a deduplicated list preserving order.
     """
     if not text:
         return []
-    tokens = []
-    # 1) JSON-like: "token" : "..."
-    for m in re.finditer(r'"token"\s*:\s*"([^"]{10,})"', text, flags=re.IGNORECASE):
-        tok = m.group(1).strip()
-        if tok:
+    tokens: List[str] = []
+
+    # 1) JSON-like fields — allow the quoted value to span lines (DOTALL)
+    json_field_re = re.compile(r'["\'](?:token|auth_?token|access_token|login_token|temp_token)["\']\s*:\s*["\'](.*?)["\']', re.IGNORECASE | re.DOTALL)
+    for m in json_field_re.finditer(text):
+        raw = m.group(1)
+        # normalize: remove whitespace/newlines introduced by visual wrapping
+        tok = re.sub(r"\s+", "", raw)
+        if tok and len(tok) >= 10:
             tokens.append(tok)
-    # 2) also accept keys like 'auth_token' etc
-    for m in re.finditer(r'"(auth_?token|access_token|login_token|temp_token)"\s*:\s*"([^"]{10,})"', text, flags=re.IGNORECASE):
-        tok = m.group(2).strip()
-        if tok:
-            tokens.append(tok)
-    # 3) generic token-like patterns: allow letters, digits, - _ + / = . minimal length 20
-    for m in re.finditer(r'([A-Za-z0-9_\-\+/=\.]{20,})', text):
+
+    # 2) Generic token-like contiguous runs (no internal spaces) — common fallback
+    for m in re.finditer(r'([A-Za-z0-9_\-\+\/=\.]{20,})', text):
         tok = m.group(1)
-        # skip things that look like numbers or dates (all digits)
         if tok.isdigit():
             continue
-        # skip common words
-        if len(tok) < 20:
-            continue
         tokens.append(tok)
-    # unique while preserving order
+
+    # Deduplicate while preserving order
     seen = set()
-    out = []
+    out: List[str] = []
     for t in tokens:
         if t in seen:
             continue
@@ -295,7 +294,8 @@ async def main():
     if not BOT_TOKEN:
         log.error("BOT_TOKEN is not set. Set BOT_TOKEN env var and restart.")
         return
-    bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+    # aiogram>=3.7: parse_mode must be passed via DefaultBotProperties
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     try:
         await dp.start_polling(bot)
     except (KeyboardInterrupt, SystemExit):
