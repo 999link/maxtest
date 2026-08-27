@@ -2,6 +2,10 @@ import asyncio
 import html
 import json
 import logging
+import re
+import io
+import zipfile
+from typing import List
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -55,6 +59,48 @@ def profile_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+# ---------------- helper: token extraction ----------------
+
+def extract_tokens_from_text(text: str) -> List[str]:
+    """Extracts tokens from a text blob.
+
+    Handles JSON-like payloads with "token": "..." and generic token strings.
+    Returns list of unique tokens found.
+    """
+    if not text:
+        return []
+    tokens = []
+    # 1) JSON-like: "token" : "..."
+    for m in re.finditer(r'"token"\s*:\s*"([^"]{10,})"', text, flags=re.IGNORECASE):
+        tok = m.group(1).strip()
+        if tok:
+            tokens.append(tok)
+    # 2) also accept keys like 'auth_token' etc
+    for m in re.finditer(r'"(auth_?token|access_token|login_token|temp_token)"\s*:\s*"([^"]{10,})"', text, flags=re.IGNORECASE):
+        tok = m.group(2).strip()
+        if tok:
+            tokens.append(tok)
+    # 3) generic token-like patterns: allow letters, digits, - _ + / = . minimal length 20
+    for m in re.finditer(r'([A-Za-z0-9_\-\+/=\.]{20,})', text):
+        tok = m.group(1)
+        # skip things that look like numbers or dates (all digits)
+        if tok.isdigit():
+            continue
+        # skip common words
+        if len(tok) < 20:
+            continue
+        tokens.append(tok)
+    # unique while preserving order
+    seen = set()
+    out = []
+    for t in tokens:
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out
+
+
 # ---------------- базовые команды ----------------
 
 @dp.message(Command("start", "help"))
@@ -71,8 +117,52 @@ async def cmd_start(m: Message):
         "/methods — список методов клиента\n"
         "/call &lt;method&gt; [args...] — вызвать метод\n"
         "/logout [PROFILE] — удалить сессию\n"
-        "/cancel — прервать диалог"
+        "/cancel — прервать диалог\n"
+        "/parse — распарсить текст/сообщение и найти токены (поддерживает JSON-like формат)"
     )
+
+
+@dp.message(Command("parse"))
+async def cmd_parse(m: Message):
+    if not allowed(m.from_user.id):
+        return
+    # Prefer message text; if absent, try caption
+    text = (m.text or "")
+    # Try to extract tokens
+    tokens = extract_tokens_from_text(text)
+    # If no tokens in text but message may contain attached document with token content,
+    # attempt to download it (txt/zip). We keep this gentle: if no document, just report.
+    if not tokens and getattr(m, "document", None):
+        try:
+            bio = io.BytesIO()
+            await m.document.download(bio)
+            bio.seek(0)
+            # if zip
+            if zipfile.is_zipfile(bio):
+                z = zipfile.ZipFile(bio)
+                for name in z.namelist():
+                    if name.lower().endswith('.txt'):
+                        data = z.read(name).decode(errors='ignore')
+                        tokens.extend(extract_tokens_from_text(data))
+            else:
+                data = bio.read().decode(errors='ignore')
+                tokens.extend(extract_tokens_from_text(data))
+        except Exception as e:
+            log.exception("parse: failed to read document: %s", e)
+            await m.answer(f"Не удалось прочитать файл: {e}")
+            return
+    if not tokens:
+        return await m.answer("Токены не найдены в тексте или файле.")
+    # Mask tokens for safety in chat: show first 6 and last 6 chars
+    def mask(t: str) -> str:
+        if len(t) <= 12:
+            return t
+        return f"{t[:6]}...{t[-6:]}"
+    masked = [mask(t) for t in tokens]
+    # reply with count and sample (up to 20)
+    sample = "\n".join(masked[:20])
+    more = f"\n...и ещё {len(tokens)-20}" if len(tokens) > 20 else ""
+    await m.answer(f"Найдено {len(tokens)} токен(ов):\n{sample}{more}")
 
 
 @dp.message(Command("cancel"))
