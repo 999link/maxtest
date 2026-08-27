@@ -1,16 +1,18 @@
 """
 Слой над pymax: убирает input() из авторизации и даёт асинхронный флоу
 request_code -> submit_code -> (submit_2fa) с выбором типа сессии.
+Добавлены параметры proxy для возможности задавать прокси на уровне сессии.
 """
 from __future__ import annotations
 
 import inspect
 import logging
 import traceback
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
-from config import WORK_DIR, build_user_agent, DEFAULT_PROFILE
+from config import WORK_DIR, build_user_agent, DEFAULT_PROFILE, PROXY_URL
 
 log = logging.getLogger("max_core")
 
@@ -126,10 +128,14 @@ class MaxSession:
     temp_token: str | None = None
     token: str | None = None
     profile_data: dict | None = None
+    proxy: str | None = None
 
     def __post_init__(self):
         self.profile = self.profile.upper()
         self.user_agent = build_user_agent(self.profile, self.ua_overrides)
+        # fallback to global PROXY_URL if not provided explicitly
+        if not self.proxy:
+            self.proxy = PROXY_URL or None
 
     @property
     def session_file(self) -> str:
@@ -162,7 +168,37 @@ class MaxSession:
         if "device_type" in params:
             kwargs["device_type"] = self.user_agent["device_type"]
 
-        self.client = cls(**kwargs)
+        # try to pass proxy to constructor in a few common parameter names
+        proxy_to_use = self.proxy
+        if proxy_to_use:
+            for key in ("proxy", "proxy_url", "proxies", "http_proxy", "https_proxy"):
+                if key in params:
+                    kwargs[key] = proxy_to_use
+                    break
+        # If constructor didn't accept proxy, fall back to env var approach
+        used_env_proxy = False
+        if proxy_to_use and not any(k in kwargs for k in ("proxy", "proxy_url", "proxies", "http_proxy", "https_proxy")):
+            # set env vars temporarily
+            used_env_proxy = True
+            old_http = os.environ.get("HTTP_PROXY")
+            old_https = os.environ.get("HTTPS_PROXY")
+            os.environ["HTTP_PROXY"] = proxy_to_use
+            os.environ["HTTPS_PROXY"] = proxy_to_use
+
+        try:
+            self.client = cls(**kwargs)
+        finally:
+            if proxy_to_use and used_env_proxy:
+                # restore env
+                if old_http is None:
+                    os.environ.pop("HTTP_PROXY", None)
+                else:
+                    os.environ["HTTP_PROXY"] = old_http
+                if old_https is None:
+                    os.environ.pop("HTTPS_PROXY", None)
+                else:
+                    os.environ["HTTPS_PROXY"] = old_https
+
         return self.client
 
     async def _connect(self):
@@ -239,9 +275,9 @@ class MaxSession:
 
 
 async def restore_session(phone: str, token: str, profile: str,
-                          user_agent: dict | None = None) -> MaxSession:
+                          user_agent: dict | None = None, proxy: str | None = None) -> MaxSession:
     """Поднимает клиент из сохранённого токена — для /me, /dialogs и т.п."""
-    s = MaxSession(phone=phone, profile=profile, ua_overrides=user_agent)
+    s = MaxSession(phone=phone, profile=profile, ua_overrides=user_agent, proxy=proxy)
     s.token = token
     s._build_client()
     for attr in ("token", "_token", "auth_token"):
