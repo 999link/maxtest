@@ -1,8 +1,8 @@
 import os
 from pathlib import Path
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_TOKEN_HERE")
-ADMINS = {int(x) for x in os.getenv("ADMINS", "").split(",") if x.strip()}
+BOT_TOKEN = 8012771975:AAH5d58TAA3n4sBxOO0mmGXFUoS4balYZtk
+ADMINS = 8754414647
 
 BASE_DIR = Path(__file__).parent
 WORK_DIR = BASE_DIR / "sessions"
