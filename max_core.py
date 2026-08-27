@@ -177,4 +177,95 @@ class MaxSession:
             fn = _pick(self.client, "send_code", "request_code", "_request_code",
                        "request_sms_code", "_send_code")
             if fn is None:
-                methods = ", ".join(s
+                methods = ", ".join(sorted(m for m in dir(self.client)
+                                           if not m.startswith("__")))
+                raise MaxError("Не найден метод запроса кода.\nМетоды клиента:\n"
+                               + methods[:1200])
+            res = await _maybe_await(_call(fn, self.phone))
+            self.temp_token = _extract_token(res) or self.temp_token
+            return (f"Код запрошен ({self.profile}, v{self.user_agent['app_version']}).\n"
+                    f"<pre>{_esc(str(res)[:800])}</pre>")
+        except MaxError:
+            raise
+        except Exception as e:
+            raise MaxError(_msg(e), raw=traceback.format_exc()[-1200:],
+                           code=type(e).__name__)
+
+    async def submit_code(self, code: str) -> dict:
+        fn = _pick(self.client, "sign_in", "_sign_in", "confirm_code", "login_by_code")
+        if fn is None:
+            raise MaxError("Не найден метод подтверждения кода (sign_in)")
+        try:
+            res = await _maybe_await(_call_signin(fn, self.temp_token, code))
+        except Exception as e:
+            if _is_2fa(e):
+                raise NeedTwoFA(_msg(e))
+            raise MaxError(_msg(e), raw=traceback.format_exc()[-1200:],
+                           code=type(e).__name__)
+        if _is_2fa(res):
+            raise NeedTwoFA("Требуется второй фактор")
+        return self._finalize(res)
+
+    async def submit_2fa(self, password: str) -> dict:
+        fn = _pick(self.client, "check_password", "sign_in_2fa", "submit_password",
+                   "_check_password", "verify_password")
+        if fn is None:
+            raise MaxError("В этой версии pymax нет метода 2FA "
+                           "(check_password/sign_in_2fa).")
+        try:
+            res = await _maybe_await(_call(fn, password))
+        except Exception as e:
+            raise MaxError(_msg(e), raw=traceback.format_exc()[-1200:],
+                           code=type(e).__name__)
+        return self._finalize(res)
+
+    def _finalize(self, res: Any) -> dict:
+        self.token = (_extract_token(res)
+                      or getattr(self.client, "token", None)
+                      or getattr(self.client, "_token", None))
+        if not self.token:
+            raise MaxError("Логин прошёл, но токен не найден в ответе", raw=res)
+        self.profile_data = _as_dict(res)
+        return {"token": self.token, "profile": self.profile,
+                "user_agent": self.user_agent, "raw": self.profile_data}
+
+    async def close(self):
+        fn = _pick(self.client, "close", "disconnect", "stop", "_close")
+        if fn:
+            try:
+                await _maybe_await(fn())
+            except Exception as e:
+                log.warning("close(): %s", e)
+
+
+async def restore_session(phone: str, token: str, profile: str,
+                          user_agent: dict | None = None) -> MaxSession:
+    """Поднимает клиент из сохранённого токена — для /me, /dialogs и т.п."""
+    s = MaxSession(phone=phone, profile=profile, ua_overrides=user_agent)
+    s.token = token
+    s._build_client()
+    for attr in ("token", "_token", "auth_token"):
+        if hasattr(s.client, attr):
+            try:
+                setattr(s.client, attr, token)
+            except Exception:
+                pass
+    await s._connect()
+    return s
+
+
+async def call_method(session: MaxSession, name: str, *args) -> Any:
+    """Универсальный вызов метода клиента — ядро «песочницы» для тестов."""
+    fn = getattr(session.client, name, None)
+    if not callable(fn):
+        raise MaxError(f"Метод {name} не найден у клиента")
+    try:
+        return await _maybe_await(_call(fn, *args))
+    except Exception as e:
+        raise MaxError(_msg(e), raw=traceback.format_exc()[-1200:],
+                       code=type(e).__name__)
+
+
+def list_methods(session: MaxSession) -> list[str]:
+    return sorted(m for m in dir(session.client)
+                  if not m.startswith("__") and callable(getattr(session.client, m, None)))
