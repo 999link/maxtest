@@ -13,6 +13,9 @@ else:
     # fallback to a single admin id from previous default (can be overridden via env)
     ADMINS = [8754414647]
 
+# Optional global proxy for pymax/http traffic. Can be empty or like "http://127.0.0.1:8080"
+PROXY_URL = os.environ.get("PROXY_URL", "")
+
 BASE_DIR = Path(__file__).parent
 WORK_DIR = BASE_DIR / "sessions"
 DB_PATH = BASE_DIR / "accounts.json"
