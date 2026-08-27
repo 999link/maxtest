@@ -1,311 +1,140 @@
-import asyncio
-import html
-import json
-import logging
-import re
-import io
-import zipfile
-from typing import List
-
-from aiogram import Bot, Dispatcher, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandObject
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (CallbackQuery, InlineKeyboardButton,
-                           InlineKeyboardMarkup, Message)
-
-import storage
-from config import BOT_TOKEN, ADMINS, SESSION_PROFILES, DEFAULT_PROFILE
-from max_core import (MaxError, MaxSession, NeedTwoFA, call_method,
-                      list_methods, restore_session)
-
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-log = logging.getLogger("bot")
-
-dp = Dispatcher(storage=MemoryStorage())
-
-# активные сессии в памяти: tg_id -> MaxSession
-LIVE: dict[int, MaxSession] = {}
+# ---- proxy management commands ----
+import urllib.parse
+import requests  # make sure requests is installed in the venv
 
 
-class Auth(StatesGroup):
-    profile = State()
-    phone = State()
-    code = State()
-    twofa = State()
-
-
-def allowed(uid: int) -> bool:
-    return not ADMINS or uid in ADMINS
-
-
-def code_block(obj, limit: int = 3500) -> str:
-    if not isinstance(obj, str):
-        try:
-            obj = json.dumps(obj, ensure_ascii=False, indent=2, default=str)
-        except Exception:
-            obj = repr(obj)
-    return f"<pre>{html.escape(obj[:limit])}</pre>"
-
-
-def profile_kb() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(
-        text=f"{'📱' if p == 'ANDROID' else '🌐'} {p} · v{cfg['app_version']}",
-        callback_data=f"prof:{p}")] for p, cfg in SESSION_PROFILES.items()]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-# ---------------- helper: token extraction ----------------
-
-def extract_tokens_from_text(text: str) -> List[str]:
-    """Extracts tokens from a text blob.
-
-    Handles JSON-like payloads where the quoted token value may span lines
-    (e.g. long tokens that are visually wrapped), supports both double and
-    single quotes; also captures generic token-like contiguous strings.
-    Returns a deduplicated list preserving order.
+def _normalize_proxy_url(raw: str) -> str:
     """
-    if not text:
-        return []
-    tokens: List[str] = []
-
-    # 1) JSON-like fields — allow the quoted value to span lines (DOTALL)
-    json_field_re = re.compile(r'["\'](?:token|auth_?token|access_token|login_token|temp_token)["\']\s*:\s*["\'](.*?)["\']', re.IGNORECASE | re.DOTALL)
-    for m in json_field_re.finditer(text):
-        raw = m.group(1)
-        # normalize: remove whitespace/newlines introduced by visual wrapping
-        tok = re.sub(r"\s+", "", raw)
-        if tok and len(tok) >= 10:
-            tokens.append(tok)
-
-    # 2) Generic token-like contiguous runs (no internal spaces) — common fallback
-    for m in re.finditer(r'([A-Za-z0-9_\-\+\/=\.]{20,})', text):
-        tok = m.group(1)
-        if tok.isdigit():
-            continue
-        tokens.append(tok)
-
-    # Deduplicate while preserving order
-    seen = set()
-    out: List[str] = []
-    for t in tokens:
-        if t in seen:
-            continue
-        seen.add(t)
-        out.append(t)
-    return out
+    Ensure proxy URL is safe: percent-encode username/password if present.
+    Accepts forms:
+      http://user:pass@host:port
+      socks5://user:pass@host:port
+      http://host:port
+    Returns normalized URL string.
+    """
+    raw = raw.strip()
+    if not raw:
+        return raw
+    parsed = urllib.parse.urlsplit(raw)
+    # if no scheme, assume http
+    if not parsed.scheme:
+        raw = "http://" + raw
+        parsed = urllib.parse.urlsplit(raw)
+    username = parsed.username
+    password = parsed.password
+    if username or password:
+        # percent-encode username/password
+        user = urllib.parse.quote(username or "", safe="")
+        pwd = urllib.parse.quote(password or "", safe="")
+        netloc = f"{user}:{pwd}@{parsed.hostname}"
+        if parsed.port:
+            netloc += f":{parsed.port}"
+        new = urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path or "", parsed.query or "", parsed.fragment or ""))
+        return new
+    return raw
 
 
-# ---------------- базовые команды ----------------
-
-@dp.message(Command("start", "help"))
-async def cmd_start(m: Message):
-    if not allowed(m.from_user.id):
-        return await m.answer("Доступ закрыт.")
-    await m.answer(
-        "<b>pymax lab</b> — песочница для тестов\n\n"
-        "/login — авторизация (выбор ANDROID / WEB)\n"
-        "/sessions — сохранённые сессии\n"
-        "/use ANDROID|WEB — сделать сессию активной\n"
-        "/token — показать токен и user-agent\n"
-        "/connect — поднять клиент из сохранённого токена\n"
-        "/methods — список методов клиента\n"
-        "/call &lt;method&gt; [args...] — вызвать метод\n"
-        "/logout [PROFILE] — удалить сессию\n"
-        "/cancel — прервать диалог\n"
-        "/parse — распарсить текст/сообщение и найти токены (поддерживает JSON-like формат)"
-    )
-
-
-@dp.message(Command("parse"))
-async def cmd_parse(m: Message):
+@dp.message(Command("setproxy"))
+async def cmd_setproxy(m: Message):
     if not allowed(m.from_user.id):
         return
-    # Prefer message text; if absent, try caption
-    text = (m.text or "")
-    # Try to extract tokens
-    tokens = extract_tokens_from_text(text)
-    # If no tokens in text but message may contain attached document with token content,
-    # attempt to download it (txt/zip). We keep this gentle: if no document, just report.
-    if not tokens and getattr(m, "document", None):
+    text = (m.text or "").strip()
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        return await m.answer("Использование: /setproxy http://user:pass@host:port")
+    raw_proxy = parts[1].strip()
+    proxy = _normalize_proxy_url(raw_proxy)
+    # save in accounts.json for active profile
+    ok = await storage.set_proxy(m.from_user.id, proxy)
+    if not ok:
+        return await m.answer("Не удалось сохранить proxy — у вас ещё нет сохранённых сессий. Сначала /login или сохраните сессию.")
+    # try to auto-reconnect: if there's a live session, close it and try to restore
+    try:
+        acct = await storage.get_account(m.from_user.id)
+        profile = acct.get('profile') if acct else None
+        # close live session if exists
+        live = LIVE.get(m.from_user.id)
+        if live:
+            try:
+                await live.close()
+            except Exception:
+                pass
+            LIVE.pop(m.from_user.id, None)
+        # try to restore (non-blocking best-effort)
         try:
-            bio = io.BytesIO()
-            await m.document.download(bio)
-            bio.seek(0)
-            # if zip
-            if zipfile.is_zipfile(bio):
-                z = zipfile.ZipFile(bio)
-                for name in z.namelist():
-                    if name.lower().endswith('.txt'):
-                        data = z.read(name).decode(errors='ignore')
-                        tokens.extend(extract_tokens_from_text(data))
-            else:
-                data = bio.read().decode(errors='ignore')
-                tokens.extend(extract_tokens_from_text(data))
-        except Exception as e:
-            log.exception("parse: failed to read document: %s", e)
-            await m.answer(f"Не удалось прочитать файл: {e}")
-            return
-    if not tokens:
-        return await m.answer("Токены не найдены в тексте или файле.")
-    # Mask tokens for safety in chat: show first 6 and last 6 chars
-    def mask(t: str) -> str:
-        if len(t) <= 12:
-            return t
-        return f"{t[:6]}...{t[-6:]}"
-    masked = [mask(t) for t in tokens]
-    # reply with count and sample (up to 20)
-    sample = "\n".join(masked[:20])
-    more = f"\n...и ещё {len(tokens)-20}" if len(tokens) > 20 else ""
-    await m.answer(f"Найдено {len(tokens)} токен(ов):\n{sample}{more}")
-
-
-@dp.message(Command("cancel"))
-async def cmd_cancel(m: Message, state: FSMContext):
-    await state.clear()
-    await m.answer("Отменено.")
-
-
-# ---------------- авторизация ----------------
-
-@dp.message(Command("login"))
-async def cmd_login(m: Message, state: FSMContext):
-    if not allowed(m.from_user.id):
-        return
-    await state.set_state(Auth.profile)
-    await m.answer("Выбери тип сессии:", reply_markup=profile_kb())
-
-
-@dp.callback_query(Auth.profile, F.data.startswith("prof:"))
-async def pick_profile(cb: CallbackQuery, state: FSMContext):
-    prof = cb.data.split(":", 1)[1]
-    await state.update_data(profile=prof)
-    await state.set_state(Auth.phone)
-    cfg = SESSION_PROFILES[prof]
-    await cb.message.edit_text(
-        f"Профиль: <b>{prof}</b> · v{cfg['app_version']} · {cfg['os_version']}\n\n"
-        "Отправь номер в формате <code>+79991234567</code>")
-    await cb.answer()
-
-
-@dp.message(Auth.phone, F.text)
-async def got_phone(m: Message, state: FSMContext):
-    phone = m.text.strip().replace(" ", "")
-    if not phone.startswith("+") or not phone[1:].isdigit():
-        return await m.answer("Формат: <code>+79991234567</code>")
-
-    data = await state.get_data()
-    session = MaxSession(phone=phone, profile=data.get("profile", DEFAULT_PROFILE))
-    wait = await m.answer("⏳ Запрашиваю код…")
-    try:
-        info = await session.request_code()
-    except MaxError as e:
-        await state.clear()
-        return await wait.edit_text(e.pretty())
-
-    LIVE[m.from_user.id] = session
-    await state.set_state(Auth.code)
-    await wait.edit_text(f"✅ {info}\n\nВведи код из MAX:")
-
-
-@dp.message(Auth.code, F.text)
-async def got_code(m: Message, state: FSMContext):
-    session = LIVE.get(m.from_user.id)
-    if not session:
-        await state.clear()
-        return await m.answer("Сессия потеряна, начни с /login")
-
-    code = "".join(ch for ch in m.text if ch.isdigit())
-    wait = await m.answer("⏳ Проверяю код…")
-    try:
-        res = await session.submit_code(code)
-    except NeedTwoFA:
-        await state.set_state(Auth.twofa)
-        return await wait.edit_text("🔐 Включена 2FA. Введи пароль:")
-    except MaxError as e:
-        return await wait.edit_text(e.pretty() + "\n\nПопробуй ещё раз или /cancel")
-
-    await finish_login(m, state, session, res, wait)
-
-
-@dp.message(Auth.twofa, F.text)
-async def got_2fa(m: Message, state: FSMContext):
-    session = LIVE.get(m.from_user.id)
-    if not session:
-        await state.clear()
-        return await m.answer("Сессия потеряна, /login")
-
-    wait = await m.answer("⏳ Проверяю пароль…")
-    try:
-        res = await session.submit_2fa(m.text.strip())
-    except MaxError as e:
-        return await wait.edit_text(e.pretty() + "\n\nПовтори или /cancel")
-    await finish_login(m, state, session, res, wait)
-
-
-async def finish_login(m: Message, state: FSMContext,
-                       session: MaxSession, res: dict, wait: Message):
-    """Сохраняет сессию в storage и завершает FSM."""
-    try:
-        token = res.get("token") if isinstance(res, dict) else None
-        user_agent = res.get("user_agent") if isinstance(res, dict) else None
-        profile = res.get("profile") if isinstance(res, dict) else session.profile
-        raw = res.get("raw") if isinstance(res, dict) else None
-
-        if token is None:
-            # Попробуем взять из объекта session
-            token = getattr(session, "token", None)
-
-        await storage.save_account(
-            m.from_user.id,
-            phone=session.phone,
-            token=token,
-            profile=profile,
-            user_agent=user_agent,
-            extra=raw,
-        )
-
-        await state.clear()
-        await wait.edit_text("✅ Авторизация завершена.\n\n" + code_block(res))
-    except Exception as e:
-        log.exception("finish_login error: %s", e)
-        await wait.edit_text(f"Ошибка при сохранении сессии: {e}")
-
-
-# Точка входа для запуска бота
-async def _shutdown(bot: Bot):
-    # корректно закрыть все live-сессии
-    for s in list(LIVE.values()):
-        try:
-            await s.close()
+            new = await restore_session(m.from_user.id, profile=profile)
+            if new:
+                LIVE[m.from_user.id] = new
         except Exception:
+            # ignore restore failures — user can manually /connect
             pass
-    try:
-        await bot.session.close()
     except Exception:
         pass
+    await m.answer("✅ Proxy сохранён для активного профиля.\nЧтобы применить его к клиенту немедленно, выполните /connect (или сделайте /logout и затем /login).")
 
 
-async def main():
-    if not BOT_TOKEN:
-        log.error("BOT_TOKEN is not set. Set BOT_TOKEN env var and restart.")
+@dp.message(Command("unsetproxy"))
+async def cmd_unsetproxy(m: Message):
+    if not allowed(m.from_user.id):
         return
-    # aiogram>=3.7: parse_mode must be passed via DefaultBotProperties
-    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    try:
-        await dp.start_polling(bot)
-    except (KeyboardInterrupt, SystemExit):
-        pass
-    finally:
-        await _shutdown(bot)
+    removed = await storage.unset_proxy(m.from_user.id)
+    if removed:
+        await m.answer("✅ Per-profile proxy удалён. Для применения перезапустите сессию (/connect или /logout + /login).")
+    else:
+        await m.answer("Proxy не найден для активного профиля.")
 
 
-if __name__ == "__main__":
+@dp.message(Command("showproxy"))
+async def cmd_showproxy(m: Message):
+    if not allowed(m.from_user.id):
+        return
+    p = await storage.get_proxy(m.from_user.id)
+    from config import PROXY_URL
+    if p:
+        # mask credentials for safety
+        def _mask(u: str) -> str:
+            try:
+                parsed = urllib.parse.urlsplit(u)
+                if parsed.username or parsed.password:
+                    net = f"{parsed.scheme}://{parsed.hostname}"
+                    if parsed.port:
+                        net += f":{parsed.port}"
+                    return f"{net}  (auth: ****)"
+            except Exception:
+                pass
+            return u
+        await m.answer(f"Per-profile proxy: {_mask(p)}")
+    elif PROXY_URL:
+        await m.answer(f"Per-profile proxy не задан; используется глобальный PROXY_URL (fallback): {PROXY_URL}")
+    else:
+        await m.answer("Proxy не задан ни для профиля, ни глобально.")
+
+
+@dp.message(Command("testproxy"))
+async def cmd_testproxy(m: Message):
+    """
+    /testproxy [optional_proxy_url]
+    If proxy url provided, test it; otherwise test per-profile or global proxy.
+    """
+    if not allowed(m.from_user.id):
+        return
+    parts = (m.text or "").split(maxsplit=1)
+    proxy_to_test = None
+    if len(parts) > 1:
+        proxy_to_test = _normalize_proxy_url(parts[1].strip())
+    else:
+        proxy_to_test = await storage.get_proxy(m.from_user.id)
+        if not proxy_to_test:
+            from config import PROXY_URL
+            proxy_to_test = PROXY_URL or None
+    if not proxy_to_test:
+        return await m.answer("Proxy не задан (ни передан в команде, ни в профиле, ни глобально).")
+    await m.answer("Проверяю прокси (короткий HTTP GET)...")
     try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+        resp = requests.get("https://api.ipify.org?format=json", proxies={"http": proxy_to_test, "https": proxy_to_test}, timeout=10)
+        if resp.status_code == 200:
+            await m.answer(f"OK — прокси работает. IP через прокси: {resp.text}")
+        else:
+            await m.answer(f"Прокси ответил статусом {resp.status_code}: {resp.text[:400]}")
+    except Exception as e:
+        await m.answer(f"Ошибка при тесте прокси: {e}")
