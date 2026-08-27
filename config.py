@@ -1,6 +1,47 @@
 import os
 from pathlib import Path
 
+# Auto-load .env from repo root when running via python directly.
+# This lets you keep BOT_TOKEN, ADMINS, PROXY_URL etc in a .env file without
+# exporting them manually in the shell.
+def _load_dotenv_file(path: Path):
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key = key.strip()
+                val = val.strip()
+                # remove surrounding quotes if present
+                if len(val) >= 2 and ((val[0] == val[-1]) and val[0] in "'\""):
+                    val = val[1:-1]
+                # do not override existing environment variables
+                if key not in os.environ:
+                    os.environ[key] = val
+    except FileNotFoundError:
+        return
+    except Exception:
+        # don't crash on malformed .env; ignore and continue
+        return
+
+# try .env next to this file, or one level up
+try:
+    _here = Path(__file__).resolve()
+    _candidates = [
+        _here.parent / ".env",
+        _here.parent.parent / ".env",
+    ]
+    for _p in _candidates:
+        if _p.exists():
+            _load_dotenv_file(_p)
+            break
+except Exception:
+    pass
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 # ADMINS can be provided as comma-separated env var, e.g. "12345,67890"
 ADMINS_ENV = os.environ.get("ADMINS", "")
