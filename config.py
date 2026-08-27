@@ -1,8 +1,17 @@
 import os
 from pathlib import Path
 
-BOT_TOKEN = 8012771975:AAH5d58TAA3n4sBxOO0mmGXFUoS4balYZtk
-ADMINS = 8754414647
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+# ADMINS can be provided as comma-separated env var, e.g. "12345,67890"
+ADMINS_ENV = os.environ.get("ADMINS", "")
+if ADMINS_ENV:
+    try:
+        ADMINS = [int(x) for x in ADMINS_ENV.split(",") if x.strip()]
+    except ValueError:
+        ADMINS = []
+else:
+    # fallback to a single admin id from previous default (can be overridden via env)
+    ADMINS = [8754414647]
 
 BASE_DIR = Path(__file__).parent
 WORK_DIR = BASE_DIR / "sessions"
